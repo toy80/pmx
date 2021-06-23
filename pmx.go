@@ -92,27 +92,34 @@ type Material struct {
 	NumVerts int32 // 材质对应的顶点数, 一定是3的倍数. 所有材质的顶点数加起来等于模型的顶点数.
 }
 
-type IKLink struct {
+type IKJoint struct {
 	Bone        int32
 	AngleLimit  uint8
 	MinAngleXyz [3]float32 // 最小角度(弧度角), 适用于 AngleLimit=true
 	MaxAngleXyz [3]float32 // 最大角度(弧度角), 适用于 AngleLimit=true
 }
 
+type IKLink struct {
+	EndBone      int32     // end-effector 适用于 IK
+	NumLoop      int32     // 循环次数, 适用于 IK
+	MaxAngleStep float32   // IK单步角度限制(弧度角), 适用于 IK
+	Joints       []IKJoint // IK链表, 适用于 IK
+}
+
 type BoneFlags uint16
 
 const (
 	BONE_FLAG_TAIL_BONE             BoneFlags = 1 << iota // 骨骼尾部连接到另一骨骼
-	BONE_FLAG_ROTATE                                      // 支持旋转
-	BONE_FLAG_TRANSLATE                                   // 支持移动
+	BONE_FLAG_ROTATION_ENABLED                            // 支持旋转
+	BONE_FLAG_TRANSLATION_ENABLED                         // 支持移动
 	BONE_FLAG_VISIBLE                                     // 可见
 	BONE_FLAG_ENABLED                                     // 允许操作
-	BONE_FLAG_IK                                          // 反向动力学
+	BONE_FLAG_INVERSE_KINEMATICS                          // 反向动力学
 	BONE_FLAG_0X0040                                      //
-	BONE_FLAG_LOCAL_ASSIGN                                // 本地付与. 0=用户变形/IK/多重付与, 1=父骨骼的本地变形
-	BONE_FLAG_ROTATE_ASSIGN                               // 旋转付与. 随着付与骨旋转.
-	BONE_FLAG_TRANSLATE_ASSIGN                            // 移动付与. 随着付与骨移动.
-	BONE_FLAG_FIXED_AXIS                                  // 固定轴. 限制只能绕着特定轴旋转.
+	BONE_FLAG_0X0080                                      // 本地付与. 0=用户变形/IK/多重付与, 1=父骨骼的本地变形 ???
+	BONE_FLAG_BLEND_ROTATION                              // 旋转付与. 随着付与骨旋转.
+	BONE_FLAG_BLEND_TRANSLATION                           // 移动付与. 随着付与骨移动.
+	BONE_FLAG_TWIST_AXIS                                  // 固定轴. 限制只能绕着特定轴旋转.
 	BONE_FLAG_LOCAL_AXIS                                  // 本地XZ轴指向
 	BONE_FLAG_PHYSICAL_AFTER_DEFORM                       // 先计算变形, 后计算物理
 	BONE_FLAG_EXTERNAL_PARENT                             // 外部父骨骼
@@ -129,26 +136,29 @@ type Bone struct {
 
 	Flags BoneFlags
 
-	TailBone   int32      // 适用于 BONE_FLAG_TAIL_BONE==1
-	TailOffset [3]float32 // 适用于 BONE_FLAG_TAIL_BONE==0
+	// 骨骼尖端显示为指向另一根骨骼.  适用于 BONE_FLAG_TAIL_BONE==1
+	TailBone int32
 
-	AssignParent int32   // 适用于付与
-	AssignFrac   float32 // 适用于付与
+	// 骨骼尖端显示为指向相对于骨骼的自身的偏移量. BONE_FLAG_TAIL_BONE==0
+	TailOffset [3]float32
 
-	FixedAxis [3]float32 // 限制轴的指向. (限制轴和本地轴可以同时打开)
+	// 骨间数值调制的数值来源骨骼序号
+	BlendTransformSourceBone int32
+
+	// 骨间数值调制的比例 DST' = SRC * frac + DST * (1 - frac) ???
+	BlendTransformFrac float32
+
+	TwistAxis [3]float32 // 轴向旋转坐标轴
 
 	LocalXAxis [3]float32 // 适用于 BONE_FLAG_LOCAL_AXIS==1
 	LocalZAxis [3]float32 // 适用于 BONE_FLAG_LOCAL_AXIS==1
 
-	ExternalParent int32 // 适用于 ExternalParent
+	ExternalParent int32 // 适用于 BONE_FLAG_EXTERNAL_PARENT=1
 
-	IKTargetBone      int32    // 适用于 IK
-	IKLoop            int32    // 循环次数, 适用于 IK
-	IKAngleDeltaLimit float32  // IK单步角度限制(弧度角), 适用于 IK
-	IKLink            []IKLink // IK链表, 适用于 IK
+	IKLink IKLink // IK链 适用于 BONE_FLAG_IK=1
 }
 
-// Morph在mmd软件中的分组. 主要是便于操作, 对模型本身意义不大.
+// Morph在mmd软件中的分组. 主要是便于界面操作, 对模型本身意义不大.
 type MorphPanel uint8
 
 const (
@@ -186,9 +196,9 @@ type UVMorphOffset struct {
 }
 
 type BoneMorphOffset struct {
-	Bone       int32
-	Translate  [3]float32
-	RotateQuat [4]float32 // 四元组 (x, y, z, w)
+	Bone        int32
+	Translation [3]float32
+	Rotation    [4]float32 // Quaternion 四元组 (x, y, z, w)
 }
 
 type MaterialMorphOffset struct {
@@ -212,10 +222,10 @@ type ProxyMorphOffset struct {
 type FlipMorphOffset ProxyMorphOffset
 
 type ImpulseMorphOffset struct {
-	RigidBody int32
-	Local     uint8      // 0:OFF 1:ON
-	Translate [3]float32 // (x, y, z) 速度
-	Rotate    [3]float32 // (x, y, z) 扭矩
+	RigidBody   int32
+	Local       uint8      // 0:OFF 1:ON
+	Translation [3]float32 // (x, y, z) 速度
+	Rotation    [3]float32 // (x, y, z) 扭矩
 }
 
 // 变形动画
@@ -241,7 +251,7 @@ type DisplayFrameElem struct {
 	Index int32 // 骨骼或变形的索引
 }
 
-// DisplayFrame 是骨骼分组, 主要用于界面显示时把同组的骨骼放在一起
+// DisplayFrame 动作分组, 主要用于界面显示, 把同组的骨骼/动画放在一起.
 type DisplayFrame struct {
 	Name   string
 	NameEN string
@@ -282,11 +292,11 @@ type RigidBody struct {
 	Position [3]float32 // (x,y,z) 位置
 	Rotation [3]float32 // (x,y,z) 旋转 (弧度角)
 
-	Mass             float32 // 物理量: 质量
-	TranslateDamping float32 // 物理量: 移动衰减 attenuation
-	RotateDamping    float32 // 物理量: 旋转衰减
-	Repulsion        float32 // 物理量: 排斥力
-	Friction         float32 // 物理量: 摩檫力
+	Mass               float32 // 物理量: 质量
+	TranslationDamping float32 // 物理量: 移动衰减 attenuation
+	RotationDamping    float32 // 物理量: 旋转衰减
+	Repulsion          float32 // 物理量: 排斥力
+	Friction           float32 // 物理量: 摩檫力
 
 	Physical RigidPhysical // RIGID_PHYSICAL_*
 
@@ -415,7 +425,8 @@ type SoftBody struct {
 	PinVertices       []int32
 }
 
-// PMX模型
+// PMX模型.
+// 默认左手坐标系, Y轴朝上.
 type PMX struct {
 	Header Header
 
@@ -816,8 +827,8 @@ func (pm *PMX) decodeBones(r io.Reader) (err error) {
 	for i := range pm.Bones {
 
 		pm.Bones[i].TailBone = -1
-		pm.Bones[i].AssignParent = -1
-		pm.Bones[i].IKTargetBone = -1
+		pm.Bones[i].BlendTransformSourceBone = -1
+		pm.Bones[i].IKLink.EndBone = -1
 		pm.Bones[i].ExternalParent = -1
 
 		if pm.Bones[i].Name, err = decodeString(r, pm.Header.TextEncoding); err != nil {
@@ -847,16 +858,16 @@ func (pm *PMX) decodeBones(r io.Reader) (err error) {
 				return
 			}
 		}
-		if pm.Bones[i].Flags&BONE_FLAG_ROTATE_ASSIGN != 0 || pm.Bones[i].Flags&BONE_FLAG_TRANSLATE_ASSIGN != 0 {
-			if pm.Bones[i].AssignParent, err = decodeInt(r, pm.Header.SizeBoneIndex); err != nil {
+		if pm.Bones[i].Flags&BONE_FLAG_BLEND_ROTATION != 0 || pm.Bones[i].Flags&BONE_FLAG_BLEND_TRANSLATION != 0 {
+			if pm.Bones[i].BlendTransformSourceBone, err = decodeInt(r, pm.Header.SizeBoneIndex); err != nil {
 				return
 			}
-			if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].AssignFrac); err != nil {
+			if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].BlendTransformFrac); err != nil {
 				return
 			}
 		}
-		if pm.Bones[i].Flags&BONE_FLAG_FIXED_AXIS != 0 {
-			if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].FixedAxis); err != nil {
+		if pm.Bones[i].Flags&BONE_FLAG_TWIST_AXIS != 0 {
+			if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].TwistAxis); err != nil {
 				return
 			}
 		}
@@ -873,34 +884,34 @@ func (pm *PMX) decodeBones(r io.Reader) (err error) {
 				return
 			}
 		}
-		if pm.Bones[i].Flags&BONE_FLAG_IK != 0 {
-			if pm.Bones[i].IKTargetBone, err = decodeInt(r, pm.Header.SizeBoneIndex); err != nil {
+		if pm.Bones[i].Flags&BONE_FLAG_INVERSE_KINEMATICS != 0 {
+			if pm.Bones[i].IKLink.EndBone, err = decodeInt(r, pm.Header.SizeBoneIndex); err != nil {
 				return
 			}
-			if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLoop); err != nil {
+			if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLink.NumLoop); err != nil {
 				return
 			}
-			if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKAngleDeltaLimit); err != nil {
+			if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLink.MaxAngleStep); err != nil {
 				return
 			}
-			var numIK int32
-			if err = binary.Read(r, binary.LittleEndian, &numIK); err != nil {
+			var numIKJoints int32
+			if err = binary.Read(r, binary.LittleEndian, &numIKJoints); err != nil {
 				return
 			}
-			if numIK > 0 {
-				pm.Bones[i].IKLink = make([]IKLink, numIK)
-				for j := range pm.Bones[i].IKLink {
-					if pm.Bones[i].IKLink[j].Bone, err = decodeInt(r, pm.Header.SizeBoneIndex); err != nil {
+			if numIKJoints > 0 {
+				pm.Bones[i].IKLink.Joints = make([]IKJoint, numIKJoints)
+				for j := range pm.Bones[i].IKLink.Joints {
+					if pm.Bones[i].IKLink.Joints[j].Bone, err = decodeInt(r, pm.Header.SizeBoneIndex); err != nil {
 						return
 					}
-					if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLink[j].AngleLimit); err != nil {
+					if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLink.Joints[j].AngleLimit); err != nil {
 						return
 					}
-					if pm.Bones[i].IKLink[j].AngleLimit != 0 {
-						if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLink[j].MinAngleXyz); err != nil {
+					if pm.Bones[i].IKLink.Joints[j].AngleLimit != 0 {
+						if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLink.Joints[j].MinAngleXyz); err != nil {
 							return
 						}
-						if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLink[j].MaxAngleXyz); err != nil {
+						if err = binary.Read(r, binary.LittleEndian, &pm.Bones[i].IKLink.Joints[j].MaxAngleXyz); err != nil {
 							return
 						}
 					}
@@ -965,10 +976,10 @@ func (pm *PMX) decodeMorphs(r io.Reader) (err error) {
 					if pm.Morphs[i].BoneMorphOffsets[j].Bone, err = decodeInt(r, pm.Header.SizeBoneIndex); err != nil {
 						return
 					}
-					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].BoneMorphOffsets[j].Translate); err != nil {
+					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].BoneMorphOffsets[j].Translation); err != nil {
 						return
 					}
-					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].BoneMorphOffsets[j].RotateQuat); err != nil {
+					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].BoneMorphOffsets[j].Rotation); err != nil {
 						return
 					}
 				}
@@ -1035,10 +1046,10 @@ func (pm *PMX) decodeMorphs(r io.Reader) (err error) {
 					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].ImpulseMorphOffsets[j].Local); err != nil {
 						return
 					}
-					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].ImpulseMorphOffsets[j].Translate); err != nil {
+					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].ImpulseMorphOffsets[j].Translation); err != nil {
 						return
 					}
-					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].ImpulseMorphOffsets[j].Rotate); err != nil {
+					if err = binary.Read(r, binary.LittleEndian, &pm.Morphs[i].ImpulseMorphOffsets[j].Rotation); err != nil {
 						return
 					}
 				}
@@ -1135,10 +1146,10 @@ func (pm *PMX) decodeRigidBodies(r io.Reader) (err error) {
 		if err = binary.Read(r, binary.LittleEndian, &pm.RigidBodies[i].Mass); err != nil {
 			return
 		}
-		if err = binary.Read(r, binary.LittleEndian, &pm.RigidBodies[i].TranslateDamping); err != nil {
+		if err = binary.Read(r, binary.LittleEndian, &pm.RigidBodies[i].TranslationDamping); err != nil {
 			return
 		}
-		if err = binary.Read(r, binary.LittleEndian, &pm.RigidBodies[i].RotateDamping); err != nil {
+		if err = binary.Read(r, binary.LittleEndian, &pm.RigidBodies[i].RotationDamping); err != nil {
 			return
 		}
 		if err = binary.Read(r, binary.LittleEndian, &pm.RigidBodies[i].Repulsion); err != nil {
