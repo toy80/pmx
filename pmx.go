@@ -9,6 +9,9 @@ import (
 	"unicode/utf16"
 )
 
+// var autoDescriptionForEncode = ""
+var autoDescriptionForEncode = "encoded with golang package github.com/toy80/pmx"
+
 // PMX文件头
 type Header struct {
 	Magic              uint32  // "PMX " 0x20584d50
@@ -66,6 +69,8 @@ const (
 	MATERIAL_FLAG_VERTEXCOLOR // 2.1
 	MATERIAL_FLAG_DRAWPOINT   // 2.1
 	MATERIAL_FLAG_DRAWLINE    // 2.1
+
+	MATERIAL_FLAG_MASK_2_1 = MATERIAL_FLAG_VERTEXCOLOR | MATERIAL_FLAG_DRAWPOINT | MATERIAL_FLAG_DRAWLINE
 )
 
 // 材质
@@ -465,7 +470,7 @@ func decodeString(r io.Reader, encoding uint8) (s string, err error) {
 		return "", nil
 	}
 
-	// 1 是 UTF8. 其他值都当作UTF8处理
+	// encoding!=0 都当作UTF8处理
 	buf := make([]byte, int(numBytes))
 	if _, err = io.ReadFull(r, buf); err != nil {
 		return
@@ -1382,15 +1387,16 @@ func (pm *PMX) decodeSoftBodies(r io.Reader) (err error) {
 	return
 }
 
-func Decode(r io.Reader) (pm *PMX, err error) {
-	pm = new(PMX)
-
+// Decode PMX 2.0/2.1 format from reader r
+func Decode(r io.Reader) (p *PMX, err error) {
+	p = new(PMX)
 	defer func() {
 		if err != nil {
-			pm = nil
+			p = nil
 		}
 	}()
 
+	pm := p
 	if err = pm.decodeHeader(r); err != nil {
 		err = fmt.Errorf("pmx: error decoding header: %w", err)
 		return
@@ -1454,5 +1460,1019 @@ func Decode(r io.Reader) (pm *PMX, err error) {
 	// }
 	// fmt.Println(`}`)
 
+	return
+}
+
+type encPMX struct {
+	*PMX
+	Header                 Header
+	haveVersion201Contents bool
+}
+
+func encodeString(w io.Writer, s string, encoding uint8) (err error) {
+	var buf []byte
+	if encoding == 0 {
+		// 0 是 UTF16, 应该是偶数字节
+		buf16 := utf16.Encode([]rune(s))
+		for _, r := range buf16 {
+			buf = append(buf, byte(r&0xFF), byte((r>>8)&0xFF))
+		}
+	} else {
+		// encoding!=0 都当作UTF8处理
+		buf = []byte(s)
+	}
+
+	numBytes := int32(len(buf))
+	if err = binary.Write(w, binary.LittleEndian, &numBytes); err != nil {
+		return
+	}
+
+	if numBytes > 0 {
+		if _, err = w.Write(buf); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func encodeInt(w io.Writer, n int32, size uint8) (err error) {
+	switch size {
+	case 1:
+		tmp := int8(n)
+		if err = binary.Write(w, binary.LittleEndian, &tmp); err != nil {
+			return
+		}
+		n = int32(tmp)
+		return
+	case 2:
+		tmp := int16(n)
+		if err = binary.Write(w, binary.LittleEndian, &tmp); err != nil {
+			return
+		}
+		n = int32(tmp)
+		return
+	case 4:
+		if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+			return
+		}
+		return
+	default:
+		return fmt.Errorf("unsupported integer size %d, want 1,2 or 4", size)
+	}
+}
+
+func encodeUint(w io.Writer, n uint32, size uint8) (err error) {
+	switch size {
+	case 1:
+		tmp := uint8(n)
+		if err = binary.Write(w, binary.LittleEndian, &tmp); err != nil {
+			return
+		}
+		n = uint32(tmp)
+		return
+	case 2:
+		tmp := uint16(n)
+		if err = binary.Write(w, binary.LittleEndian, &tmp); err != nil {
+			return
+		}
+		n = uint32(tmp)
+		return
+	case 4:
+		if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+			return
+		}
+		return
+	default:
+		return fmt.Errorf("unsupported integer size %d, want 1,2 or 4", size)
+	}
+}
+
+func lenToSizeI(n int) uint8 {
+	if n > 0x00008000 {
+		return 4
+	}
+	if n > 0x00000080 {
+		return 2
+	}
+	return 1
+}
+
+func lenToSizeU(n int) uint8 {
+	if n > 0x00010000 {
+		return 4
+	}
+	if n > 0x00000100 {
+		return 2
+	}
+	return 1
+}
+
+func (pm *encPMX) detectVersion201Contents() bool {
+	if len(pm.SoftBodies) != 0 {
+		return true
+	}
+
+	for _, m := range pm.Materials {
+		if m.Flags&MATERIAL_FLAG_VERTEXCOLOR != 0 ||
+			m.Flags&MATERIAL_FLAG_DRAWPOINT != 0 ||
+			m.Flags&MATERIAL_FLAG_DRAWLINE != 0 {
+			return true
+		}
+	}
+
+	for _, m := range pm.Morphs {
+		if m.Type == MORPH_TYPE_FLIP || m.Type == MORPH_TYPE_IMPULSE {
+			return true
+		}
+	}
+
+	for _, j := range pm.Joints {
+		if j.Type > JOINT_TYPE_SPRING_6DOF {
+			return true
+		}
+	}
+	return false
+
+}
+
+func (pm *encPMX) prepareForEncode() (err error) {
+
+	pm.Header = pm.PMX.Header
+
+	// 额外的UV需要手动设置, 检查它的范围
+	if pm.Header.NumExtraUV > 4 {
+		return fmt.Errorf("unsupported number extra UV: %d", pm.Header.NumExtraUV)
+	}
+
+	// PMX格式标志
+	pm.Header.Magic = 0x20584d50
+
+	// PMX版本
+	pm.haveVersion201Contents = pm.detectVersion201Contents()
+	if pm.Header.Version == 0 {
+		if pm.haveVersion201Contents {
+			pm.Header.Version = 2.1
+		} else {
+			pm.Header.Version = 2.0
+		}
+	}
+
+	// 文件头剩下的字节数, 2.0和2.1版都是整好8个字节
+	pm.Header.NumBytes = 8
+
+	// 根据数据量构造8个参数的正确性
+	pm.Header.TextEncoding = 0
+
+	// 根据数据数量自动确定各项索引的长度
+	pm.Header.SizeVertexIndex = lenToSizeI(len(pm.Vertices))
+	pm.Header.SizeTextureIndex = lenToSizeI(len(pm.Textures))
+	pm.Header.SizeMaterialIndex = lenToSizeI(len(pm.Materials))
+	pm.Header.SizeBoneIndex = lenToSizeI(len(pm.Bones))
+	pm.Header.SizeMorphIndex = lenToSizeI(len(pm.Morphs))
+	pm.Header.SizeRigidBodyIndex = lenToSizeI(len(pm.RigidBodies))
+	return nil
+}
+
+func (pm *encPMX) encodeHeader(w io.Writer) (err error) {
+	// 2.0和2.1版文件头尺寸固定, 整块写
+	return binary.Write(w, binary.LittleEndian, &pm.Header)
+}
+
+func (pm *encPMX) encodeTextInfo(w io.Writer) (err error) {
+	if err = encodeString(w, pm.Name, pm.Header.TextEncoding); err != nil {
+		return
+	}
+	if err = encodeString(w, pm.NameEN, pm.Header.TextEncoding); err != nil {
+		return
+	}
+	if autoDescriptionForEncode != "" && pm.Description == "" && pm.DescriptionEN == "" {
+		if err = encodeString(w, autoDescriptionForEncode, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeString(w, autoDescriptionForEncode, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		return
+	}
+	if err = encodeString(w, pm.Description, pm.Header.TextEncoding); err != nil {
+		return
+	}
+	if err = encodeString(w, pm.DescriptionEN, pm.Header.TextEncoding); err != nil {
+		return
+	}
+	return
+}
+
+func (pm *encPMX) encodeVertices(w io.Writer) (err error) {
+	n := int32(len(pm.Vertices))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.Vertices {
+		if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].Position); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].Normal); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].UV); err != nil {
+			return
+		}
+		if pm.Header.NumExtraUV > 0 {
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].UV1); err != nil {
+				return
+			}
+		}
+		if pm.Header.NumExtraUV > 1 {
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].UV2); err != nil {
+				return
+			}
+		}
+		if pm.Header.NumExtraUV > 2 {
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].UV3); err != nil {
+				return
+			}
+		}
+		if pm.Header.NumExtraUV > 3 {
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].UV4); err != nil {
+				return
+			}
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].BoneMethod); err != nil {
+			return
+		}
+		switch pm.Vertices[i].BoneMethod {
+		case BDEF1:
+			if err = encodeInt(w, pm.Vertices[i].Bones[0], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+		case BDEF2:
+			if err = encodeInt(w, pm.Vertices[i].Bones[0], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = encodeInt(w, pm.Vertices[i].Bones[1], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].Weights[0]); err != nil {
+				return
+			}
+		case BDEF4, QDEF:
+			if err = encodeInt(w, pm.Vertices[i].Bones[0], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = encodeInt(w, pm.Vertices[i].Bones[1], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = encodeInt(w, pm.Vertices[i].Bones[2], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = encodeInt(w, pm.Vertices[i].Bones[3], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].Weights[0]); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].Weights[1]); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].Weights[2]); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].Weights[3]); err != nil {
+				return
+			}
+		case SDEF:
+			if err = encodeInt(w, pm.Vertices[i].Bones[0], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = encodeInt(w, pm.Vertices[i].Bones[1], pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].Weights[0]); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].SDEF_C); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].SDEF_R0); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].SDEF_R1); err != nil {
+				return
+			}
+		default:
+			return fmt.Errorf("unsupported bone deform method: %d", pm.Vertices[i].BoneMethod)
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Vertices[i].EdgeFrac); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (pm *encPMX) encodeFaces(w io.Writer) (err error) {
+	n := int32(len(pm.Faces))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.Faces {
+		if err = encodeUint(w, pm.Faces[i], pm.Header.SizeVertexIndex); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (pm *encPMX) encodeTextures(w io.Writer) (err error) {
+	n := int32(len(pm.Textures))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.Textures {
+		if err = encodeString(w, pm.Textures[i], pm.Header.TextEncoding); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (pm *encPMX) encodeMaterials(w io.Writer) (err error) {
+	n := int32(len(pm.Materials))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.Materials {
+		if err = encodeString(w, pm.Materials[i].Name, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeString(w, pm.Materials[i].NameEN, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Materials[i].Diffuse); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Materials[i].Specular); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Materials[i].Ambient); err != nil {
+			return
+		}
+		flags := pm.Materials[i].Flags
+		if pm.Header.Version < 2.1 {
+			flags &= ^(MATERIAL_FLAG_MASK_2_1)
+		}
+		if err = binary.Write(w, binary.LittleEndian, &flags); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Materials[i].EdgeColor); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Materials[i].EdgeSize); err != nil {
+			return
+		}
+		if err = encodeInt(w, pm.Materials[i].Texture, pm.Header.SizeTextureIndex); err != nil {
+			return
+		}
+		if err = encodeInt(w, pm.Materials[i].SpTexture, pm.Header.SizeTextureIndex); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Materials[i].SpMode); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Materials[i].ShareToon); err != nil {
+			return
+		}
+		if pm.Materials[i].ShareToon == 0 {
+			if err = encodeInt(w, pm.Materials[i].ToonTexture, 1); err != nil {
+				return
+			}
+		} else {
+			if err = encodeInt(w, pm.Materials[i].ToonTexture, pm.Header.SizeTextureIndex); err != nil {
+				return
+			}
+		}
+		if err = encodeString(w, pm.Materials[i].Comment, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Materials[i].NumVerts); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (pm *encPMX) encodeBones(w io.Writer) (err error) {
+	n := int32(len(pm.Bones))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.Bones {
+		if err = encodeString(w, pm.Bones[i].Name, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeString(w, pm.Bones[i].NameEN, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].Position); err != nil {
+			return
+		}
+		if err = encodeInt(w, pm.Bones[i].Parent, pm.Header.SizeBoneIndex); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].MorphLevel); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].Flags); err != nil {
+			return
+		}
+		if pm.Bones[i].Flags&BONE_FLAG_TAIL_BONE != 0 {
+			if err = encodeInt(w, pm.Bones[i].TailBone, pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+		} else {
+			if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].TailOffset); err != nil {
+				return
+			}
+		}
+		if pm.Bones[i].Flags&BONE_FLAG_BLEND_ROTATION != 0 || pm.Bones[i].Flags&BONE_FLAG_BLEND_TRANSLATION != 0 {
+			if err = encodeInt(w, pm.Bones[i].BlendTransformSourceBone, pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].BlendTransformFrac); err != nil {
+				return
+			}
+		}
+		if pm.Bones[i].Flags&BONE_FLAG_TWIST_AXIS != 0 {
+			if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].TwistAxis); err != nil {
+				return
+			}
+		}
+		if pm.Bones[i].Flags&BONE_FLAG_LOCAL_AXIS != 0 {
+			if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].LocalXAxis); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].LocalZAxis); err != nil {
+				return
+			}
+		}
+		if pm.Bones[i].Flags&BONE_FLAG_EXTERNAL_PARENT != 0 {
+			if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].ExternalParent); err != nil {
+				return
+			}
+		}
+		if pm.Bones[i].Flags&BONE_FLAG_INVERSE_KINEMATICS != 0 {
+			if err = encodeInt(w, pm.Bones[i].IKLink.EndBone, pm.Header.SizeBoneIndex); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].IKLink.NumLoop); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].IKLink.MaxAngleStep); err != nil {
+				return
+			}
+			numIKJoints := int32(len(pm.Bones[i].IKLink.Joints))
+			if err = binary.Write(w, binary.LittleEndian, &numIKJoints); err != nil {
+				return
+			}
+			for j := range pm.Bones[i].IKLink.Joints {
+				if err = encodeInt(w, pm.Bones[i].IKLink.Joints[j].Bone, pm.Header.SizeBoneIndex); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].IKLink.Joints[j].AngleLimit); err != nil {
+					return
+				}
+				if pm.Bones[i].IKLink.Joints[j].AngleLimit != 0 {
+					if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].IKLink.Joints[j].MinAngleXyz); err != nil {
+						return
+					}
+					if err = binary.Write(w, binary.LittleEndian, &pm.Bones[i].IKLink.Joints[j].MaxAngleXyz); err != nil {
+						return
+					}
+				}
+			}
+		}
+	}
+	return
+}
+
+func (pm *encPMX) encodeMorphs(w io.Writer) (err error) {
+	n := int32(len(pm.Morphs))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.Morphs {
+		if err = encodeString(w, pm.Morphs[i].Name, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeString(w, pm.Morphs[i].NameEN, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].Panel); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].Type); err != nil {
+			return
+		}
+
+		switch pm.Morphs[i].Type {
+		case MORPH_TYPE_PROXY:
+			numOffsets := int32(len(pm.Morphs[i].ProxyMorphOffsets))
+			if err = binary.Write(w, binary.LittleEndian, &numOffsets); err != nil {
+				return
+			}
+			for j := range pm.Morphs[i].ProxyMorphOffsets {
+				if err = encodeInt(w, pm.Morphs[i].ProxyMorphOffsets[j].Morph, pm.Header.SizeMorphIndex); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].ProxyMorphOffsets[j].Frac); err != nil {
+					return
+				}
+			}
+		case MORPH_TYPE_POSITION:
+			numOffsets := int32(len(pm.Morphs[i].PositionMorphOffsets))
+			if err = binary.Write(w, binary.LittleEndian, &numOffsets); err != nil {
+				return
+			}
+			for j := range pm.Morphs[i].PositionMorphOffsets {
+				if err = encodeInt(w, pm.Morphs[i].PositionMorphOffsets[j].Vertex, pm.Header.SizeVertexIndex); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].PositionMorphOffsets[j].Offset); err != nil {
+					return
+				}
+			}
+		case MORPH_TYPE_BONE:
+			numOffsets := int32(len(pm.Morphs[i].BoneMorphOffsets))
+			if err = binary.Write(w, binary.LittleEndian, &numOffsets); err != nil {
+				return
+			}
+			for j := range pm.Morphs[i].BoneMorphOffsets {
+				if err = encodeInt(w, pm.Morphs[i].BoneMorphOffsets[j].Bone, pm.Header.SizeBoneIndex); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].BoneMorphOffsets[j].Translation); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].BoneMorphOffsets[j].Rotation); err != nil {
+					return
+				}
+			}
+		case MORPH_TYPE_UV, MORPH_TYPE_UV1, MORPH_TYPE_UV2, MORPH_TYPE_UV3, MORPH_TYPE_UV4:
+			numOffsets := int32(len(pm.Morphs[i].UVMorphOffsets))
+			if err = binary.Write(w, binary.LittleEndian, &numOffsets); err != nil {
+				return
+			}
+			for j := range pm.Morphs[i].UVMorphOffsets {
+				if err = encodeInt(w, pm.Morphs[i].UVMorphOffsets[j].Vertex, pm.Header.SizeVertexIndex); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].UVMorphOffsets[j].Offset); err != nil {
+					return
+				}
+			}
+		case MORPH_TYPE_MATERIAL:
+			numOffsets := int32(len(pm.Morphs[i].MaterialMorphOffsets))
+			if err = binary.Write(w, binary.LittleEndian, &numOffsets); err != nil {
+				return
+			}
+			for j := range pm.Morphs[i].MaterialMorphOffsets {
+				if err = encodeInt(w, pm.Morphs[i].MaterialMorphOffsets[j].Material, pm.Header.SizeMaterialIndex); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].Addition); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].Diffuse); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].Specular); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].Ambient); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].EdgeColor); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].EdgeSize); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].Texture); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].SpTexture); err != nil {
+					return
+				}
+				if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].MaterialMorphOffsets[j].ToonTexture); err != nil {
+					return
+				}
+			}
+		case MORPH_TYPE_FLIP:
+			if pm.Header.Version >= 2.1 {
+				numOffsets := int32(len(pm.Morphs[i].FlipMorphOffsets))
+				if err = binary.Write(w, binary.LittleEndian, &numOffsets); err != nil {
+					return
+				}
+				for j := range pm.Morphs[i].FlipMorphOffsets {
+					if err = encodeInt(w, pm.Morphs[i].FlipMorphOffsets[j].Morph, pm.Header.SizeMorphIndex); err != nil {
+						return
+					}
+					if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].FlipMorphOffsets[j].Frac); err != nil {
+						return
+					}
+				}
+			} else {
+				if err = binary.Write(w, binary.LittleEndian, int32(0)); err != nil {
+					return
+				}
+			}
+		case MORPH_TYPE_IMPULSE:
+			if pm.Header.Version >= 2.1 {
+				numOffsets := int32(len(pm.Morphs[i].ImpulseMorphOffsets))
+				if err = binary.Write(w, binary.LittleEndian, &numOffsets); err != nil {
+					return
+				}
+				for j := range pm.Morphs[i].ImpulseMorphOffsets {
+					if err = encodeInt(w, pm.Morphs[i].ImpulseMorphOffsets[j].RigidBody, pm.Header.SizeRigidBodyIndex); err != nil {
+						return
+					}
+					if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].ImpulseMorphOffsets[j].Local); err != nil {
+						return
+					}
+					if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].ImpulseMorphOffsets[j].Translation); err != nil {
+						return
+					}
+					if err = binary.Write(w, binary.LittleEndian, &pm.Morphs[i].ImpulseMorphOffsets[j].Rotation); err != nil {
+						return
+					}
+				}
+			} else {
+				if err = binary.Write(w, binary.LittleEndian, int32(0)); err != nil {
+					return
+				}
+			}
+		default:
+			return fmt.Errorf("unkown morph type %d", pm.Morphs[i].Type)
+		}
+
+	}
+	return
+}
+
+func (pm *encPMX) encodeDisplayFrames(w io.Writer) (err error) {
+	n := int32(len(pm.DisplayFrames))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.DisplayFrames {
+		if err = encodeString(w, pm.DisplayFrames[i].Name, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeString(w, pm.DisplayFrames[i].NameEN, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.DisplayFrames[i].SpecialFrame); err != nil {
+			return
+		}
+		numElems := int32(len(pm.DisplayFrames[i].Elements))
+		if err = binary.Write(w, binary.LittleEndian, &numElems); err != nil {
+			return
+		}
+		for j := range pm.DisplayFrames[i].Elements {
+			if err = binary.Write(w, binary.LittleEndian, &pm.DisplayFrames[i].Elements[j].Type); err != nil {
+				return
+			}
+			if pm.DisplayFrames[i].Elements[j].Type == 0 {
+				if err = encodeInt(w, pm.DisplayFrames[i].Elements[j].Index, pm.Header.SizeBoneIndex); err != nil {
+					return
+				}
+			} else {
+				if err = encodeInt(w, pm.DisplayFrames[i].Elements[j].Index, pm.Header.SizeMorphIndex); err != nil {
+					return
+				}
+			}
+		}
+	}
+	return
+}
+
+func (pm *encPMX) encodeRigidBodies(w io.Writer) (err error) {
+	n := int32(len(pm.RigidBodies))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.RigidBodies {
+		if err = encodeString(w, pm.RigidBodies[i].Name, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeString(w, pm.RigidBodies[i].NameEN, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeInt(w, pm.RigidBodies[i].Bone, pm.Header.SizeBoneIndex); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Group); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].NonCollisionGroup); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Shape); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Size); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Position); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Rotation); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Mass); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].TranslationDamping); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].RotationDamping); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Repulsion); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Friction); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.RigidBodies[i].Physical); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (pm *encPMX) encodeJoints(w io.Writer) (err error) {
+	n := int32(len(pm.Joints))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.Joints {
+		if err = encodeString(w, pm.Joints[i].Name, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeString(w, pm.Joints[i].NameEN, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		jointType := pm.Joints[i].Type
+		if pm.Header.Version < 2.1 && jointType > JOINT_TYPE_SPRING_6DOF {
+			jointType = JOINT_TYPE_SPRING_6DOF // 无论如何处理都会有问题, 这里直接改为2.0支持的格式
+		}
+		if err = binary.Write(w, binary.LittleEndian, &jointType); err != nil {
+			return
+		}
+		if err = encodeInt(w, pm.Joints[i].RigidBodyA, pm.Header.SizeRigidBodyIndex); err != nil {
+			return
+		}
+		if err = encodeInt(w, pm.Joints[i].RigidBodyB, pm.Header.SizeRigidBodyIndex); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Joints[i].Position); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Joints[i].Rotation); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Joints[i].MinPosition); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Joints[i].MaxPosition); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Joints[i].MinRotation); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Joints[i].MaxRotation); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Joints[i].K1); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.Joints[i].K2); err != nil {
+			return
+		}
+
+	}
+	return
+}
+
+func (pm *encPMX) encodeSoftBodies(w io.Writer) (err error) {
+	n := int32(len(pm.SoftBodies))
+	if err = binary.Write(w, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for i := range pm.SoftBodies {
+		if err = encodeString(w, pm.SoftBodies[i].Name, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = encodeString(w, pm.SoftBodies[i].NameEN, pm.Header.TextEncoding); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Shape); err != nil {
+			return
+		}
+
+		if err = encodeInt(w, pm.SoftBodies[i].Material, pm.Header.SizeMaterialIndex); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Group); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].NonCollisionGroup); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Flags); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].BLinkDistance); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].NumCluster); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].TotalMass); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].CollisionMargin); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].AeroModel); err != nil {
+			return
+		}
+
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.VCF); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.DP); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.DG); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.LF); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.PR); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.VC); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.DF); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.MT); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.CHR); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.KHR); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.SHR); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Config.AHR); err != nil {
+			return
+		}
+
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Cluster.SRHR_CL); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Cluster.SKHR_CL); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Cluster.SSHR_CL); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Cluster.SR_SPLT_CL); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Cluster.SK_SPLT_CL); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Cluster.SS_SPLT_CL); err != nil {
+			return
+		}
+
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Iteration.V_IT); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Iteration.P_IT); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Iteration.D_IT); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].Iteration.C_IT); err != nil {
+			return
+		}
+
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].PhyMaterial.LST); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].PhyMaterial.AST); err != nil {
+			return
+		}
+		if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].PhyMaterial.VST); err != nil {
+			return
+		}
+
+		numAnchor := int32(len(pm.SoftBodies[i].AnchorRigidBodies))
+		if err = binary.Write(w, binary.LittleEndian, &numAnchor); err != nil {
+			return
+		}
+		for j := range pm.SoftBodies[i].AnchorRigidBodies {
+			if err = encodeInt(w, pm.SoftBodies[i].AnchorRigidBodies[j].RigidBody, pm.Header.SizeRigidBodyIndex); err != nil {
+				return
+			}
+			if err = encodeInt(w, pm.SoftBodies[i].AnchorRigidBodies[j].Vertex, pm.Header.SizeVertexIndex); err != nil {
+				return
+			}
+			if err = binary.Write(w, binary.LittleEndian, &pm.SoftBodies[i].AnchorRigidBodies[j].NearMode); err != nil {
+				return
+			}
+		}
+
+		numPin := int32(len(pm.SoftBodies[i].PinVertices))
+		if err = binary.Write(w, binary.LittleEndian, &numPin); err != nil {
+			return
+		}
+		for j := range pm.SoftBodies[i].PinVertices {
+			if err = encodeInt(w, pm.SoftBodies[i].PinVertices[j], pm.Header.SizeVertexIndex); err != nil {
+				return
+			}
+		}
+	}
+	return
+}
+
+// Encode as PMX 2.0/2.1 format into writer w
+func Encode(w io.Writer, p *PMX) (err error) {
+	pm := &encPMX{PMX: p}
+	if err = pm.prepareForEncode(); err != nil {
+		err = fmt.Errorf("pmx: error preparing for encode: %w", err)
+		return
+	}
+	if err = pm.encodeHeader(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding header: %w", err)
+		return
+	}
+	if err = pm.encodeTextInfo(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding text info: %w", err)
+		return
+	}
+	if err = pm.encodeVertices(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding vertices: %w", err)
+		return
+	}
+	if err = pm.encodeFaces(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding faces: %w", err)
+		return
+	}
+	if err = pm.encodeTextures(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding textures: %w", err)
+		return
+	}
+	if err = pm.encodeMaterials(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding materials: %w", err)
+		return
+	}
+	if err = pm.encodeBones(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding bones: %w", err)
+		return
+	}
+	if err = pm.encodeMorphs(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding morphs: %w", err)
+		return
+	}
+	if err = pm.encodeDisplayFrames(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding display frames: %w", err)
+		return
+	}
+	if err = pm.encodeRigidBodies(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding rigid bodies: %w", err)
+		return
+	}
+	if err = pm.encodeJoints(w); err != nil {
+		err = fmt.Errorf("pmx: error encoding joints: %w", err)
+		return
+	}
+	if pm.Header.Version >= 2.1 {
+		if err = pm.encodeSoftBodies(w); err != nil {
+			err = fmt.Errorf("pmx: error encoding soft bodies: %w", err)
+			return
+		}
+	}
 	return
 }
